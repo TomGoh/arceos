@@ -14,6 +14,7 @@ use core::{
 use axhal::context::TaskContext;
 #[cfg(feature = "tls")]
 use axhal::tls::TlsArea;
+use bitflags::bitflags;
 use futures_util::{future::poll_fn, task::AtomicWaker};
 use kspin::SpinNoIrq;
 use memory_addr::{VirtAddr, align_up_4k};
@@ -23,6 +24,21 @@ use crate::{AxCpuMask, AxTask, AxTaskRef, future::block_on};
 /// A unique identifier for a thread.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TaskId(u64);
+
+bitflags! {
+    /// Signal event flags for waitpid reporting (stored in thread group leader).
+    ///
+    /// These events persist until explicitly consumed by waitpid, even if the process
+    /// becomes a zombie. This matches Linux's signal_struct behavior where stop/continue
+    /// events are tracked at the process level.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct SignalEvents: u8 {
+        /// Process has an unreported stop event (SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU)
+        const PENDING_STOP_EVENT = 1 << 0;
+        /// Process has an unreported continue event (SIGCONT)
+        const PENDING_CONT_EVENT = 1 << 1;
+    }
+}
 
 /// The possible states of a task.
 #[repr(u8)]
@@ -84,6 +100,12 @@ pub struct TaskInner {
 
     exit_code: AtomicI32,
     wait_for_exit: AtomicWaker,
+
+    /// Signal event flags for thread group leader (TID == TGID), these
+    signal_events: AtomicU8,
+    /// The signal that most recently stopped this process for thread group
+    /// leader only
+    last_stop_signal: AtomicU8,
 
     kstack: Option<TaskStack>,
     ctx: UnsafeCell<TaskContext>,
@@ -277,6 +299,8 @@ impl TaskInner {
             preempt_disable_count: AtomicUsize::new(0),
             exit_code: AtomicI32::new(0),
             wait_for_exit: AtomicWaker::new(),
+            signal_events: AtomicU8::new(0),
+            last_stop_signal: AtomicU8::new(0),
             kstack: None,
             ctx: UnsafeCell::new(TaskContext::new()),
             #[cfg(feature = "task-ext")]
@@ -433,6 +457,70 @@ impl TaskInner {
     #[inline]
     pub(crate) fn set_on_cpu(&self, on_cpu: bool) {
         self.on_cpu.store(on_cpu, Ordering::Release)
+    }
+
+    /// Records a stop signal effect (for thread group leader).
+    ///
+    /// Sets the PENDING_STOP_EVENT flag and records which signal caused the
+    /// stop. This does NOT clear any pending continue event - stop and
+    /// continue events are independent and can both be pending
+    /// simultaneously.
+    #[inline]
+    pub fn set_stop_signal(&self, signal: u8) {
+        self.last_stop_signal.store(signal, Ordering::Release);
+        self.signal_events
+            .fetch_or(SignalEvents::PENDING_STOP_EVENT.bits(), Ordering::Release);
+    }
+
+    /// Records a continue signal effect (for thread group leader).
+    ///
+    /// Sets the PENDING_CONT_EVENT flag and clears the recorded stop signal.
+    /// This does NOT clear any pending stop event - stop and continue events
+    /// are independent and can both be pending simultaneously.
+    #[inline]
+    pub fn set_cont_signal(&self) {
+        self.last_stop_signal.store(0, Ordering::Release);
+        self.signal_events
+            .fetch_or(SignalEvents::PENDING_CONT_EVENT.bits(), Ordering::Release);
+    }
+
+    /// Peeks at a pending stop signal event without consuming it.
+    ///
+    /// Returns the signal that caused the stop if there is an unreported stop
+    /// event.
+    #[inline]
+    pub fn peek_pending_stop_event(&self) -> Option<u8> {
+        let events = SignalEvents::from_bits_truncate(self.signal_events.load(Ordering::Acquire));
+        if events.contains(SignalEvents::PENDING_STOP_EVENT) {
+            let signal = self.last_stop_signal.load(Ordering::Acquire);
+            if signal != 0 { Some(signal) } else { None }
+        } else {
+            None
+        }
+    }
+
+    /// Consumes (clears) the pending stop signal event.
+    #[inline]
+    pub fn consume_stop_event(&self) {
+        self.last_stop_signal.store(0, Ordering::Release);
+        self.signal_events
+            .fetch_and(!SignalEvents::PENDING_STOP_EVENT.bits(), Ordering::Release);
+    }
+
+    /// Peeks at a pending continue signal event without consuming it.
+    ///
+    /// Returns true if there is an unreported continue event.
+    #[inline]
+    pub fn peek_pending_cont_event(&self) -> bool {
+        let events = SignalEvents::from_bits_truncate(self.signal_events.load(Ordering::Acquire));
+        events.contains(SignalEvents::PENDING_CONT_EVENT)
+    }
+
+    /// Consumes (clears) the pending continue signal event.
+    #[inline]
+    pub fn consume_cont_event(&self) {
+        self.signal_events
+            .fetch_and(!SignalEvents::PENDING_CONT_EVENT.bits(), Ordering::Release);
     }
 }
 
